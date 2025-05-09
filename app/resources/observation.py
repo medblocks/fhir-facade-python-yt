@@ -1,6 +1,6 @@
 # CRUD & search logic -> Observation FHIR 
 from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, Request, status, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,29 +11,14 @@ from fhir.resources.reference import Reference
 
 from ..db import get_db
 from ..models import BloodPressureModel, HeartRateModel, PatientModel # Import PatientModel for joins/filtering
+from ..utils import FHIRJSONResponse, fhir_error_handler
 
 router = APIRouter()
-
-# Added from patient.py
-def remove_nulls(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove null values from a dictionary recursively and convert dates to strings."""
-    if isinstance(d, date): # Handles datetime.date
-        return d.isoformat()
-    # Handle datetime.datetime if it appears before model_dump converts it
-    if isinstance(d, datetime):
-        return d.isoformat() # FHIR typically wants ISO 8601 for datetimes
-    if not isinstance(d, dict):
-        return d
-    return {
-        k: remove_nulls(v) if isinstance(v, (dict, date, datetime)) else v # Added datetime
-        for k, v in d.items()
-        if v is not None and (not isinstance(v, dict) or remove_nulls(v))
-    }
 
 # Refactored to_bundle
 def to_bundle(resources: List[Observation], type_: str = "searchset") -> Bundle:
     """Creates a FHIR Bundle from a list of FHIR resource Pydantic models."""
-    serialized_resources = [remove_nulls(r.model_dump()) for r in resources]
+    serialized_resources = [r.model_dump(exclude_none=True) for r in resources]
     return Bundle.model_construct(
         type=type_,
         total=len(resources),
@@ -130,31 +115,60 @@ async def read_observation(
     """Read a single observation by ID."""
     if observation_id.startswith("bp-"):
         # Blood pressure observation
-        bp_id = int(observation_id[3:])
+        try:
+            bp_id = int(observation_id[3:])
+        except ValueError:
+            return fhir_error_handler(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid observation ID format", 
+                diagnostic=f"Expected numeric ID after 'bp-' prefix, received: {observation_id[3:]}"
+            )
+            
         result = await db.execute(
             select(BloodPressureModel).where(BloodPressureModel.id == bp_id)
         )
         bp = result.scalar_one_or_none()
         if not bp:
-            raise HTTPException(status_code=404, detail="Blood pressure observation not found")
+            return fhir_error_handler(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Blood pressure observation not found",
+                diagnostic=f"No blood pressure observation with ID {bp_id} exists"
+            )
         observation = bp_to_observation(bp)
-        return JSONResponse(content=remove_nulls(observation.model_dump()), status_code=200, media_type="application/fhir+json")
+        return FHIRJSONResponse(content=observation.model_dump(exclude_none=True), status_code=200, media_type="application/fhir+json")
     elif observation_id.startswith("hr-"):
         # Heart rate observation
-        hr_id = int(observation_id[3:])
+        try:
+            hr_id = int(observation_id[3:])
+        except ValueError:
+            return fhir_error_handler(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid observation ID format",
+                diagnostic=f"Expected numeric ID after 'hr-' prefix, received: {observation_id[3:]}"
+            )
+            
         result = await db.execute(
             select(HeartRateModel).where(HeartRateModel.id == hr_id)
         )
         hr = result.scalar_one_or_none()
         if not hr:
-            raise HTTPException(status_code=404, detail="Heart rate observation not found")
+            return fhir_error_handler(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Heart rate observation not found",
+                diagnostic=f"No heart rate observation with ID {hr_id} exists"
+            )
         observation = hr_to_observation(hr)
-        return JSONResponse(content=remove_nulls(observation.model_dump()), status_code=200, media_type="application/fhir+json")
+        return FHIRJSONResponse(content=observation.model_dump(exclude_none=True), status_code=200, media_type="application/fhir+json")
     else:
-        raise HTTPException(status_code=400, detail="Invalid observation ID format")
+        return fhir_error_handler(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid observation ID format",
+            diagnostic=f"Observation ID must start with 'bp-' or 'hr-', received: {observation_id}"
+        )
 
 @router.get("/Observation", response_model=Bundle, summary="Search Observations", tags=["Observation"])
 async def search_observations(
+    request: Request,
     patient: Optional[str] = Query(None, description="Patient reference (e.g., 'Patient/123')"),
     code: Optional[str] = Query(None, description="Observation code (e.g., '8867-4' for heart rate)"),
     date: Optional[str] = Query(None, description="Date in YYYY-MM-DD format"),
@@ -169,17 +183,29 @@ async def search_observations(
         try:
             search_date = datetime.strptime(date, "%Y-%m-%d").date()
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+            return fhir_error_handler(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid date format",
+                diagnostic=f"Date must be in YYYY-MM-DD format, received: {date}"
+            )
 
     # Parse patient ID if provided
     patient_id = None
     if patient:
         if not patient.startswith("Patient/"):
-            raise HTTPException(status_code=400, detail="Invalid patient reference format")
+            return fhir_error_handler(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid patient reference format",
+                diagnostic="Patient reference must be in the format 'Patient/{id}'"
+            )
         try:
             patient_id = int(patient.split("/")[1])
         except (IndexError, ValueError):
-            raise HTTPException(status_code=400, detail="Invalid patient ID")
+            return fhir_error_handler(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid patient ID",
+                diagnostic=f"Expected numeric patient ID, received: {patient}"
+            )
 
     # Search blood pressure observations
     bp_query = select(BloodPressureModel)
@@ -212,4 +238,4 @@ async def search_observations(
             all_observation_models.append(observation) # Add model to list
 
     bundle = to_bundle(all_observation_models)
-    return JSONResponse(content=remove_nulls(bundle.model_dump()), status_code=200, media_type="application/fhir+json") 
+    return FHIRJSONResponse(content=bundle.model_dump(exclude_none=True), status_code=200, media_type="application/fhir+json") 

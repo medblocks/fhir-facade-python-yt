@@ -3,7 +3,7 @@ from fastapi import FastAPI
 # from fastapi.middleware.cors import CORSMiddleware
 import logging
 
-from .resources import patient, observation
+from .resources import patient, observation, capability_statement
 from .db import engine, Base # Import Base if you want to create tables
 
 # Configure logging
@@ -36,6 +36,8 @@ app = FastAPI(
 # Include routers
 app.include_router(patient.router, prefix="/fhir", tags=["Patient"])
 app.include_router(observation.router, prefix="/fhir", tags=["Observation"])
+app.include_router(capability_statement.router, prefix="/fhir", tags=["Capability"])
+
 
 @app.get("/", include_in_schema=False)
 async def root():

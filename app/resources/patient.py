@@ -1,6 +1,6 @@
 # CRUD & search logic -> Patient FHIR 
 from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, Request, status, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy import select, extract
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,20 +11,9 @@ import re
 
 from ..db import get_db
 from ..models import PatientModel
+from ..utils import FHIRJSONResponse, fhir_error_handler
 
 router = APIRouter()
-
-def remove_nulls(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove null values from a dictionary recursively and convert dates to strings."""
-    if isinstance(d, date):
-        return d.isoformat()
-    if not isinstance(d, dict):
-        return d
-    return {
-        k: remove_nulls(v) if isinstance(v, (dict, date)) else v
-        for k, v in d.items()
-        if v is not None and (not isinstance(v, dict) or remove_nulls(v))
-    }
 
 def validate_fhir_date(date_str: str) -> bool:
     """
@@ -77,7 +66,7 @@ def row_to_patient(db_patient: PatientModel) -> Patient:
 def to_bundle(resources: List, type_: str="searchset") -> Bundle:
     """Creates a FHIR Bundle from a list of resources."""
     # Convert each resource to a dict and ensure dates are serialized
-    serialized_resources = [remove_nulls(r.model_dump()) for r in resources]
+    serialized_resources = [r.model_dump(exclude_none=True) for r in resources]
     return Bundle.model_construct(
         type=type_,
         total=len(resources),
@@ -91,13 +80,17 @@ async def read_patient(patient_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(PatientModel).where(PatientModel.id == patient_id))
     db_patient = result.scalar_one_or_none()
     if not db_patient:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+        return fhir_error_handler(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Patient with ID {patient_id} not found"
+        )
     patient = row_to_patient(db_patient)
-    return JSONResponse(content=remove_nulls(patient.model_dump()), status_code=status.HTTP_200_OK)
+    return FHIRJSONResponse(content=patient.model_dump(exclude_none=True), status_code=status.HTTP_200_OK)
 
 #  --- Search Patients ---
 @router.get("/Patient", response_model=Bundle, summary="Search Patients", tags=["Patient"])
 async def search_patients(
+    request: Request,
     family: Optional[str] = Query(None, description="Search by family name (case-insensitive, partial match)"),
     given: Optional[str] = Query(None, description="Search by given name (case-insensitive, partial match)"),
     birthdate: Optional[str] = Query(None, description="Search by birth date (YYYY, YYYY-MM, or YYYY-MM-DD)"),
@@ -111,9 +104,10 @@ async def search_patients(
         query = query.where(PatientModel.first_name.ilike(f"%{given}%"))
     if birthdate:
         if not validate_fhir_date(birthdate):
-            raise HTTPException(
+            return fhir_error_handler(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid birthdate format. Must be YYYY, YYYY-MM, or YYYY-MM-DD."
+                detail="Invalid birthdate format",
+                diagnostic=f"Birthdate must be in YYYY, YYYY-MM, or YYYY-MM-DD format. Received: {birthdate}"
             )
         
         parts = birthdate.split('-')
@@ -144,16 +138,17 @@ async def search_patients(
                 birth_date = date.fromisoformat(birthdate)
                 query = query.where(PatientModel.date_of_birth == birth_date)
             except ValueError:
-                raise HTTPException(
+                return fhir_error_handler(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid birthdate format. Please use YYYY-MM-DD."
+                    detail="Invalid birthdate",
+                    diagnostic=f"Invalid calendar date: {birthdate}"
                 )
 
     result = await db.execute(query)
     db_patients = result.scalars().all()
     patients = [row_to_patient(p) for p in db_patients]
     bundle = to_bundle(patients)
-    return JSONResponse(content=remove_nulls(bundle.model_dump()), status_code=status.HTTP_200_OK)
+    return FHIRJSONResponse(content=bundle.model_dump(exclude_none=True), status_code=status.HTTP_200_OK)
 
 @router.post("/Patient", status_code=status.HTTP_201_CREATED, response_model=Patient, summary="Create Patient", tags=["Patient"])
 async def create_patient(resource: Patient, db: AsyncSession = Depends(get_db)):
@@ -162,9 +157,10 @@ async def create_patient(resource: Patient, db: AsyncSession = Depends(get_db)):
     """
     # Basic validation
     if not resource.name or not resource.name[0].family or not resource.name[0].given:
-        raise HTTPException(
+        return fhir_error_handler(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Patient resource must include at least one name with family and given name."
+            detail="Invalid Patient resource",
+            diagnostic="Patient resource must include at least one name with family and given name"
         )
 
     db_birth_date_for_model: Optional[date] = None
@@ -180,24 +176,27 @@ async def create_patient(resource: Patient, db: AsyncSession = Depends(get_db)):
             birth_date_str = birth_date_input
         else:
             # This case should ideally not be reached if FHIR model parsing is consistent
-            raise HTTPException(
+            return fhir_error_handler(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Unexpected type for birthDate: {type(birth_date_input)}. Expected FHIR DateType, datetime.date, or string."
+                detail="Internal Server Error",
+                diagnostic=f"Unexpected type for birthDate: {type(birth_date_input)}. Expected FHIR DateType, datetime.date, or string."
             )
 
         # 1. Validate general FHIR date format (YYYY, YYYY-MM, YYYY-MM-DD)
         if not validate_fhir_date(birth_date_str):
-            raise HTTPException(
+            return fhir_error_handler(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid birthDate format: '{birth_date_str}'. Must be YYYY, YYYY-MM, or YYYY-MM-DD."
+                detail="Invalid birthDate format",
+                diagnostic=f"Invalid birthDate format: '{birth_date_str}'. Must be YYYY, YYYY-MM, or YYYY-MM-DD."
             )
         
         # 2. Enforce full date (YYYY-MM-DD) for database storage
         date_parts = birth_date_str.split('-')
         if len(date_parts) != 3:
-            raise HTTPException(
+            return fhir_error_handler(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Database requires a full birth date (YYYY-MM-DD). Received '{birth_date_str}'. Partial dates are not supported for creation."
+                detail="Partial dates not supported",
+                diagnostic=f"Database requires a full birth date (YYYY-MM-DD). Received '{birth_date_str}'. Partial dates are not supported for creation."
             )
         
         # 3. Validate if the YYYY-MM-DD string is a valid calendar date and convert
@@ -205,9 +204,10 @@ async def create_patient(resource: Patient, db: AsyncSession = Depends(get_db)):
             db_birth_date_for_model = date.fromisoformat(birth_date_str)
         except ValueError:
             # This catches invalid dates like "2023-02-30"
-            raise HTTPException(
+            return fhir_error_handler(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid birth date: '{birth_date_str}' is not a valid calendar date."
+                detail="Invalid birth date",
+                diagnostic=f"Invalid birth date: '{birth_date_str}' is not a valid calendar date."
             )
 
     db_patient = PatientModel(
@@ -221,11 +221,12 @@ async def create_patient(resource: Patient, db: AsyncSession = Depends(get_db)):
         await db.refresh(db_patient)
     except Exception as e:
         await db.rollback()
-        raise HTTPException(
+        return fhir_error_handler(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database transaction failed."
+            detail="Database transaction failed",
+            diagnostic=str(e)
         )
 
     created_patient = row_to_patient(db_patient)
     headers = {"Location": f"/Patient/{created_patient.id}"}
-    return JSONResponse(content=remove_nulls(created_patient.model_dump()), status_code=status.HTTP_201_CREATED, headers=headers, media_type="application/fhir+json") 
+    return FHIRJSONResponse(content=created_patient.model_dump(exclude_none=True), status_code=status.HTTP_201_CREATED, headers=headers, media_type="application/fhir+json") 
